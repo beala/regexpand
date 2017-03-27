@@ -36,6 +36,7 @@ data Regex = Lit Char
            | Concat Regex Regex
            | Alt Regex Regex
            | Kleene Regex
+           | Any
              deriving (Show, Eq)
 
 -- Regex without the Kleene star.
@@ -46,7 +47,10 @@ data ReducedRegex = RLit Char
                     deriving (Show, Eq)
 
 parseRegex :: P.Parsec T.Text () Regex
-parseRegex = P.buildExpressionParser table term
+parseRegex = parseRegex_ <* P.eof
+                             
+parseRegex_ :: P.Parsec T.Text () Regex
+parseRegex_ = P.buildExpressionParser table term
 
 table :: Monad m => P.OperatorTable T.Text () m Regex
 table = [ [ P.Postfix (P.char '*' *> return Kleene) ]
@@ -55,8 +59,9 @@ table = [ [ P.Postfix (P.char '*' *> return Kleene) ]
 
 term :: P.Parsec T.Text () Regex
 term = escaped
-       <|> Lit <$> P.noneOf "*()|?."
-       <|> P.between (P.char '(') (P.char ')') parseRegex
+       <|> Lit <$> P.noneOf reserved
+       <|> P.char '.' *> return Any
+       <|> P.between (P.char '(') (P.char ')') parseRegex_
 
 escaped :: P.Parsec T.Text () Regex
 escaped = do
@@ -70,6 +75,9 @@ reserved = "*()|?."
 -- Use a source of randomness to produce a single string.
 produceRandom :: (St.MonadState Rand.StdGen m) => Regex -> m T.Text
 produceRandom Empty = return ""
+produceRandom Any = do
+  r <- St.state Rand.random
+  return $ T.pack [r]
 produceRandom (Lit s) = return (T.pack [s])
 produceRandom (Concat r1 r2) = (T.append) <$> produceRandom r1 <*> produceRandom r2
 produceRandom (Alt r1 r2) = do
@@ -99,13 +107,14 @@ produceAll (RAlt r1 r2) =
 expandKleene :: Int -> Regex -> Regex
 expandKleene maxLoop r = (Alt Empty (loop 0))
     where loop i =
-              if i < (maxLoop - 1)
+              if i < maxLoop-1
               then Alt (repeatConcat r i) (loop (i+1))
               else (repeatConcat r i)
 
 repeatConcat :: Regex -> Int -> Regex
 repeatConcat r stop = applyN stop (Concat r) r
 
+-- Apply a function to itself n times.
 applyN :: Int -> (a -> a) -> a -> a
 applyN 0 _ z = z
 applyN n f z = f (applyN (n-1) f z)
@@ -122,6 +131,7 @@ optimize (Lit r) = Lit r
 optimize Empty = Empty
 optimize (Kleene r) = Kleene (optimize r)
 optimize (Concat r1 r2) = Concat (optimize r1) (optimize r2)
+optimize Any = Any
 
 -- Apply optimize until the AST doesn't change. Ie, fixpoint.
 optimizeFix :: Regex -> Regex
@@ -132,10 +142,17 @@ optimizeFix r = let r' = optimize r in
                           
 reduceRegex :: Int -> Regex -> ReducedRegex
 reduceRegex _ (Lit r) = RLit r
+reduceRegex _ Any = alphaNum
 reduceRegex _ Empty = REmpty
 reduceRegex i (Kleene r) = reduceRegex i (expandKleene i r)
 reduceRegex i (Concat r1 r2) = RConcat (reduceRegex i r1) (reduceRegex i r2)
 reduceRegex i (Alt r1 r2) = RAlt (reduceRegex i r1) (reduceRegex i r2)
 
+alphaNum :: ReducedRegex
+alphaNum = foldr
+           RAlt
+           (RLit '9')
+           (fmap RLit ("abcdefghijklmnopqrstuvwxyz012345678" :: String))
+    
 go :: Int -> Regex -> [T.Text]
 go i = produceAll . reduceRegex i . optimizeFix
