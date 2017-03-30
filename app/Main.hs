@@ -14,23 +14,43 @@ import qualified Text.Parsec.Expr as P
 import Control.Monad.Catch (throwM, Exception)
 import Data.Foldable (traverse_)
 import System.Environment (getArgs)
+import Data.Functor.Identity (Identity)
 
 main :: IO ()
 main = do
-  -- entropy <- getStdGen
-  input <- getArgs
-  input <- case input of
+  args <- getArgs
+  input <- case args of
     arg : _ -> return (T.pack arg)
-    [] -> throwM (RegexParseError "FAIL")
+    [] -> throwM (ArgsError "No input")
   parsed <- case P.parse parseRegex "" input of
     Right p -> return $ p
     Left e -> throwM (RegexParseError (show e))
   traverse_ T.putStrLn (go 3 parsed)
 
-data RegexParseError = RegexParseError String deriving (Show, Eq)
+data RegexParseError = RegexParseError String deriving (Eq)
+data ArgsError = ArgsError String deriving (Show, Eq)
+
+instance Show RegexParseError where
+  show (RegexParseError msg) = "RegexParseError: " ++ msg
+  
                      
 instance Exception RegexParseError
-    
+
+instance Exception ArgsError
+
+data RichRegex = RichLit Char
+               | RichEmpty
+               | RichAny
+               | RichConcat RichRegex RichRegex
+               | RichAlt RichRegex RichRegex
+               | RichKleene RichRegex
+               | RichOneOrMore RichRegex
+               | RichZeroOrOne RichRegex
+               | RichCharClass CharClass
+               | RichExactly Int RichRegex
+
+data CharClass = Alpha | Num | AlphaNum
+
 data Regex = Lit Char
            | Empty
            | Concat Regex Regex
@@ -46,31 +66,70 @@ data ReducedRegex = RLit Char
                   | RAlt ReducedRegex ReducedRegex
                     deriving (Show, Eq)
 
-parseRegex :: P.Parsec T.Text () Regex
+parseRegex :: P.Parsec T.Text () RichRegex
 parseRegex = parseRegex_ <* P.eof
                              
-parseRegex_ :: P.Parsec T.Text () Regex
+parseRegex_ :: P.Parsec T.Text () RichRegex
 parseRegex_ = P.buildExpressionParser table term
 
-table :: Monad m => P.OperatorTable T.Text () m Regex
-table = [ [ P.Postfix (P.char '*' *> return Kleene) ]
-        , [ P.Infix (return Concat) P.AssocLeft ]
-        , [ P.Infix (P.char '|' *> return Alt) P.AssocLeft ]]
+table :: P.OperatorTable T.Text () Identity RichRegex
+table = [ [ P.Postfix (P.char '*' *> return RichKleene)
+          , P.Postfix (P.char '+' *> return RichOneOrMore)
+          , P.Postfix (P.char '?' *> return RichZeroOrOne)
+          , P.Postfix (P.between (P.char '{') (P.char '}') parseCount) ]
+        , [ P.Infix (return RichConcat) P.AssocLeft ]
+        , [ P.Infix (P.char '|' *> return RichAlt) P.AssocLeft ]]
 
-term :: P.Parsec T.Text () Regex
+term :: P.Parsec T.Text () RichRegex
 term = escaped
-       <|> Lit <$> P.noneOf reserved
-       <|> P.char '.' *> return Any
+       <|> P.between (P.string "[:") (P.string ":]") parseClass
+       <|> RichLit <$> P.noneOf reserved
+       <|> P.char '.' *> return RichAny
        <|> P.between (P.char '(') (P.char ')') parseRegex_
 
-escaped :: P.Parsec T.Text () Regex
+escaped :: P.Parsec T.Text () RichRegex
 escaped = do
   _ <- P.char '\\'
   e <- P.oneOf reserved
-  return $ Lit e
+  return $ RichLit e
 
 reserved :: String
-reserved = "*()|?."
+reserved = "*()|?.+[]{}\\"
+
+parseClass :: P.Parsec T.Text () RichRegex
+parseClass =
+  P.string "alpha" *> pure ( RichCharClass Alpha)
+  <|> P.string "num" *> pure (RichCharClass Num)
+  <|> P.string "alnum" *> pure (RichCharClass AlphaNum)
+
+parseCount :: P.Parsec T.Text () (RichRegex -> RichRegex)
+parseCount = do
+  count <- P.many1 P.digit
+  return $ RichExactly (read count)
+
+reduceRichRegex :: RichRegex -> Regex
+reduceRichRegex (RichLit c) = Lit c
+reduceRichRegex RichEmpty = Empty
+reduceRichRegex RichAny = Any
+reduceRichRegex (RichConcat r1 r2) = Concat (reduceRichRegex r1) (reduceRichRegex r2)
+reduceRichRegex (RichAlt r1 r2) = Alt (reduceRichRegex r1) (reduceRichRegex r2)
+reduceRichRegex (RichKleene r) = Kleene (reduceRichRegex r)
+reduceRichRegex (RichOneOrMore r) =
+  let rr = reduceRichRegex r in
+    Alt rr (Concat rr rr)
+reduceRichRegex (RichZeroOrOne r) =
+  let rr = reduceRichRegex r in
+    Alt Empty rr
+reduceRichRegex (RichCharClass Num) = numClass
+reduceRichRegex (RichCharClass Alpha) = alphaClass
+reduceRichRegex (RichCharClass AlphaNum) = Alt numClass alphaClass
+reduceRichRegex (RichExactly c r) = foldr1 Concat (replicate c (reduceRichRegex r))
+
+numClass :: Regex
+numClass = foldr1 Alt (fmap Lit ['0', '1','2','3','4','5','6','7','8','9'])
+
+alphaClass :: Regex
+alphaClass = foldr1 Alt (fmap Lit ("abcdefghijklmnopqrstuvwxyz" :: String))
 
 -- Use a source of randomness to produce a single string.
 produceRandom :: (St.MonadState Rand.StdGen m) => Regex -> m T.Text
@@ -154,5 +213,5 @@ alphaNum = foldr
            (RLit '9')
            (fmap RLit ("abcdefghijklmnopqrstuvwxyz012345678" :: String))
     
-go :: Int -> Regex -> [T.Text]
-go i = produceAll . reduceRegex i . optimizeFix
+go :: Int -> RichRegex -> [T.Text]
+go i = produceAll . reduceRegex i . optimizeFix . reduceRichRegex
