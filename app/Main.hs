@@ -13,16 +13,30 @@ import qualified Text.Parsec as P
 import qualified Text.Parsec.Expr as P
 import Control.Monad.Catch (throwM, Exception)
 import Data.Foldable (traverse_)
-import System.Environment (getArgs)
 import Data.Functor.Identity (Identity)
+import qualified Options.Applicative as Args
+
+argParser :: Args.Parser ArgOptions
+argParser = ArgOptions
+            <$> Args.optional (Args.option Args.auto
+            (Args.short 'r'
+              `Args.mappend` Args.help "Sample N random words from the language."
+              `Args.mappend` Args.metavar "N"))
+            <*> (T.pack <$> Args.strArgument
+                  (Args.metavar "REGEX"
+                  `Args.mappend` Args.help "Regex")
+                )
+
+argParserInfo :: Args.ParserInfo ArgOptions
+argParserInfo = Args.info parser options
+  where parser = argParser Args.<**> Args.helper
+        options = (Args.fullDesc `Args.mappend` Args.progDesc "Expand a regular expression.")
 
 main :: IO ()
 main = do
-  args <- getArgs
-  input <- case args of
-    arg : _ -> return (T.pack arg)
-    [] -> throwM (ArgsError "No input")
-  parsed <- case P.parse parseRegex "" input of
+  args <- Args.execParser argParserInfo
+  let inputRegex = argRegex args
+  parsed <- case P.parse parseRegex "" inputRegex of
     Right p -> return $ p
     Left e -> throwM (RegexParseError (show e))
   traverse_ T.putStrLn (go 3 parsed)
@@ -37,6 +51,12 @@ instance Show RegexParseError where
 instance Exception RegexParseError
 
 instance Exception ArgsError
+
+data ArgOptions = ArgOptions
+                  { argRandom :: Maybe Int
+                  , argRegex :: T.Text
+                  } deriving (Eq, Show)
+
 
 data RichRegex = RichLit Char
                | RichEmpty
@@ -116,7 +136,7 @@ reduceRichRegex (RichAlt r1 r2) = Alt (reduceRichRegex r1) (reduceRichRegex r2)
 reduceRichRegex (RichKleene r) = Kleene (reduceRichRegex r)
 reduceRichRegex (RichOneOrMore r) =
   let rr = reduceRichRegex r in
-    Alt rr (Concat rr rr)
+    Concat rr (Kleene rr)
 reduceRichRegex (RichZeroOrOne r) =
   let rr = reduceRichRegex r in
     Alt Empty rr
